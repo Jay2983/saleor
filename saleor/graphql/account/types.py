@@ -1,3 +1,5 @@
+from typing import List
+
 import graphene
 from django.contrib.auth import get_user_model
 from django.contrib.auth import models as auth_models
@@ -15,19 +17,19 @@ from ..app.dataloaders import AppByIdLoader
 from ..app.types import App
 from ..checkout.dataloaders import CheckoutByUserAndChannelLoader, CheckoutByUserLoader
 from ..checkout.types import Checkout
-from ..core.connection import CountableDjangoObjectType
+from ..core.connection import CountableConnection, create_connection_slice
 from ..core.descriptions import DEPRECATED_IN_3X_FIELD
 from ..core.enums import LanguageCodeEnum
-from ..core.fields import PrefetchingConnectionField
+from ..core.federation import resolve_federation_references
+from ..core.fields import ConnectionField
 from ..core.scalars import UUID
-from ..core.types import CountryDisplay, Image, Permission
+from ..core.types import CountryDisplay, Image, ModelObjectType, Permission
 from ..core.utils import from_global_id_or_error, str_to_enum
 from ..decorators import one_of_permissions_required, permission_required
 from ..giftcard.dataloaders import GiftCardsByUserLoader
 from ..meta.types import ObjectWithMetadata
 from ..order.dataloaders import OrderLineByIdLoader, OrdersByUserLoader
 from ..utils import format_permissions_for_display, get_user_or_app_from_context
-from ..wishlist.resolvers import resolve_wishlist_items_from_user
 from .dataloaders import CustomerEventsByUserLoader
 from .enums import CountryCodeEnum, CustomerEventsEnum
 from .utils import can_user_manage_group, get_groups_which_user_can_manage
@@ -48,10 +50,21 @@ class AddressInput(graphene.InputObjectType):
 
 
 @key(fields="id")
-class Address(CountableDjangoObjectType):
+class Address(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    first_name = graphene.String(required=True)
+    last_name = graphene.String(required=True)
+    company_name = graphene.String(required=True)
+    street_address_1 = graphene.String(required=True)
+    street_address_2 = graphene.String(required=True)
+    city = graphene.String(required=True)
+    city_area = graphene.String(required=True)
+    postal_code = graphene.String(required=True)
     country = graphene.Field(
         CountryDisplay, required=True, description="Shop's default country."
     )
+    country_area = graphene.String(required=True)
+    phone = graphene.String()
     is_default_shipping_address = graphene.Boolean(
         required=False, description="Address is user's default shipping address."
     )
@@ -63,20 +76,6 @@ class Address(CountableDjangoObjectType):
         description = "Represents user address data."
         interfaces = [relay.Node]
         model = models.Address
-        only_fields = [
-            "city",
-            "city_area",
-            "company_name",
-            "country",
-            "country_area",
-            "first_name",
-            "id",
-            "last_name",
-            "phone",
-            "postal_code",
-            "street_address_1",
-            "street_address_2",
-        ]
 
     @staticmethod
     def resolve_country(root: models.Address, _info):
@@ -121,16 +120,23 @@ class Address(CountableDjangoObjectType):
         return False
 
     @staticmethod
-    def __resolve_reference(root: "Address", info, **_kwargs):
-        try:
-            from .resolvers import resolve_address
+    def __resolve_references(roots: List["Address"], info, **_kwargs):
+        from .resolvers import resolve_addresses
 
-            return resolve_address(info, root.id)
-        except PermissionDenied:
-            return None
+        root_ids = [root.id for root in roots]
+        addresses = {
+            address.id: address for address in resolve_addresses(info, root_ids)
+        }
+
+        result = []
+        for root_id in root_ids:
+            _, root_id = from_global_id_or_error(root_id, Address)
+            result.append(addresses.get(int(root_id)))
+        return result
 
 
-class CustomerEvent(CountableDjangoObjectType):
+class CustomerEvent(ModelObjectType):
+    id = graphene.GlobalID(required=True)
     date = graphene.types.datetime.DateTime(
         description="Date when event happened at in ISO 8601 format."
     )
@@ -148,9 +154,8 @@ class CustomerEvent(CountableDjangoObjectType):
 
     class Meta:
         description = "History log of the customer."
-        model = models.CustomerEvent
         interfaces = [relay.Node]
-        only_fields = ["id"]
+        model = models.CustomerEvent
 
     @staticmethod
     def resolve_user(root: models.CustomerEvent, info):
@@ -210,9 +215,15 @@ class UserPermission(Permission):
         return groups
 
 
-@key("id")
-@key("email")
-class User(CountableDjangoObjectType):
+@key(fields="id")
+@key(fields="email")
+class User(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    email = graphene.String(required=True)
+    first_name = graphene.String(required=True)
+    last_name = graphene.String(required=True)
+    is_staff = graphene.Boolean(required=True)
+    is_active = graphene.Boolean(required=True)
     addresses = graphene.List(Address, description="List of all user's addresses.")
     checkout = graphene.Field(
         Checkout,
@@ -229,13 +240,14 @@ class User(CountableDjangoObjectType):
             description="Slug of a channel for which the data should be returned."
         ),
     )
-    gift_cards = PrefetchingConnectionField(
-        "saleor.graphql.giftcard.types.GiftCard",
+    gift_cards = ConnectionField(
+        "saleor.graphql.giftcard.types.GiftCardCountableConnection",
         description="List of the user gift cards.",
     )
     note = graphene.String(description="A note about the customer.")
-    orders = PrefetchingConnectionField(
-        "saleor.graphql.order.types.Order", description="List of user's orders."
+    orders = ConnectionField(
+        "saleor.graphql.order.types.OrderCountableConnection",
+        description="List of user's orders.",
     )
     user_permissions = graphene.List(
         UserPermission, description="List of user's permissions."
@@ -262,24 +274,16 @@ class User(CountableDjangoObjectType):
     language_code = graphene.Field(
         LanguageCodeEnum, description="User language code.", required=True
     )
+    default_shipping_address = graphene.Field(Address)
+    default_billing_address = graphene.Field(Address)
+
+    last_login = graphene.DateTime()
+    date_joined = graphene.DateTime(required=True)
 
     class Meta:
         description = "Represents user data."
         interfaces = [relay.Node, ObjectWithMetadata]
         model = get_user_model()
-        only_fields = [
-            "date_joined",
-            "default_billing_address",
-            "default_shipping_address",
-            "email",
-            "first_name",
-            "id",
-            "is_active",
-            "is_staff",
-            "last_login",
-            "last_name",
-            "note",
-        ]
 
     @staticmethod
     def resolve_addresses(root: models.User, _info, **_kwargs):
@@ -313,8 +317,17 @@ class User(CountableDjangoObjectType):
         )
 
     @staticmethod
-    def resolve_gift_cards(root: models.User, info, **_kwargs):
-        return GiftCardsByUserLoader(info.context).load(root.id)
+    def resolve_gift_cards(root: models.User, info, **kwargs):
+        from ..giftcard.types import GiftCardCountableConnection
+
+        def _resolve_gift_cards(gift_cards):
+            return create_connection_slice(
+                gift_cards, info, kwargs, GiftCardCountableConnection
+            )
+
+        return (
+            GiftCardsByUserLoader(info.context).load(root.id).then(_resolve_gift_cards)
+        )
 
     @staticmethod
     def resolve_user_permissions(root: models.User, _info, **_kwargs):
@@ -345,12 +358,19 @@ class User(CountableDjangoObjectType):
         return CustomerEventsByUserLoader(info.context).load(root.id)
 
     @staticmethod
-    def resolve_orders(root: models.User, info, **_kwargs):
+    def resolve_orders(root: models.User, info, **kwargs):
+        from ..order.types import OrderCountableConnection
+
         def _resolve_orders(orders):
             requester = get_user_or_app_from_context(info.context)
-            if requester.has_perm(OrderPermissions.MANAGE_ORDERS):
-                return orders
-            return list(filter(lambda order: order.status != OrderStatus.DRAFT, orders))
+            if not requester.has_perm(OrderPermissions.MANAGE_ORDERS):
+                orders = list(
+                    filter(lambda order: order.status != OrderStatus.DRAFT, orders)
+                )
+
+            return create_connection_slice(
+                orders, info, kwargs, OrderCountableConnection
+            )
 
         return OrdersByUserLoader(info.context).load(root.id).then(_resolve_orders)
 
@@ -374,36 +394,38 @@ class User(CountableDjangoObjectType):
         raise PermissionDenied()
 
     @staticmethod
-    def resolve_wishlist(root: models.User, info, **_kwargs):
-        return resolve_wishlist_items_from_user(root)
-
-    @staticmethod
-    def __resolve_reference(root: "User", info, **_kwargs):
-        User = get_user_model()
-
-        try:
-            if root.id is not None:
-                user = graphene.Node.get_node_from_global_id(info, root.id)
-            else:
-                user = get_user_model().objects.get(email=root.email)
-        except User.DoesNotExist:
-            user = None
-
-        if not user:
-            return None
-
-        auth_user = info.context.user
-        manage_staff = auth_user.has_perm(AccountPermissions.MANAGE_STAFF)
-        manage_users = auth_user.has_perm(AccountPermissions.MANAGE_USERS)
-
-        if user == auth_user or manage_staff or manage_users:
-            return user
-
-        return None
-
-    @staticmethod
     def resolve_language_code(root, _info, **_kwargs):
         return LanguageCodeEnum[str_to_enum(root.language_code)]
+
+    @staticmethod
+    def __resolve_references(roots: List["User"], info, **_kwargs):
+        from .resolvers import resolve_users
+
+        ids = set()
+        emails = set()
+        for root in roots:
+            if root.id is not None:
+                ids.add(root.id)
+            else:
+                emails.add(root.email)
+
+        users = list(resolve_users(info, ids=ids, emails=emails))
+        users_by_id = {user.id: user for user in users}
+        users_by_email = {user.email: user for user in users}
+
+        results = []
+        for root in roots:
+            if root.id is not None:
+                _, user_id = from_global_id_or_error(root.id, User)
+                results.append(users_by_id.get(int(user_id)))
+            else:
+                results.append(users_by_email.get(root.email))
+        return results
+
+
+class UserCountableConnection(CountableConnection):
+    class Meta:
+        node = User
 
 
 class ChoiceValue(graphene.ObjectType):
@@ -431,7 +453,8 @@ class AddressValidationData(graphene.ObjectType):
     postal_code_prefix = graphene.String()
 
 
-class StaffNotificationRecipient(CountableDjangoObjectType):
+class StaffNotificationRecipient(graphene.ObjectType):
+    id = graphene.ID(required=True)
     user = graphene.Field(
         User,
         description="Returns a user subscribed to email notifications.",
@@ -453,7 +476,13 @@ class StaffNotificationRecipient(CountableDjangoObjectType):
         )
         interfaces = [relay.Node]
         model = models.StaffNotificationRecipient
-        only_fields = ["user", "active"]
+
+    @staticmethod
+    def get_node(info, id):
+        try:
+            return models.StaffNotificationRecipient.objects.get(pk=id)
+        except models.StaffNotificationRecipient.DoesNotExist:
+            return None
 
     @staticmethod
     def resolve_user(root: models.StaffNotificationRecipient, info):
@@ -468,7 +497,9 @@ class StaffNotificationRecipient(CountableDjangoObjectType):
 
 
 @key(fields="id")
-class Group(CountableDjangoObjectType):
+class Group(ModelObjectType):
+    id = graphene.GlobalID(required=True)
+    name = graphene.String(required=True)
     users = graphene.List(User, description="List of group users")
     permissions = graphene.List(Permission, description="List of group permissions")
     user_can_manage = graphene.Boolean(
@@ -482,7 +513,6 @@ class Group(CountableDjangoObjectType):
         description = "Represents permission group data."
         interfaces = [relay.Node]
         model = auth_models.Group
-        only_fields = ["name", "permissions", "id"]
 
     @staticmethod
     @permission_required(AccountPermissions.MANAGE_STAFF)
@@ -500,3 +530,20 @@ class Group(CountableDjangoObjectType):
     def resolve_user_can_manage(root: auth_models.Group, info):
         user = info.context.user
         return can_user_manage_group(user, root)
+
+    @staticmethod
+    def __resolve_references(roots: List["Group"], info, **_kwargs):
+        from .resolvers import resolve_permission_groups
+
+        requestor = get_user_or_app_from_context(info.context)
+        if not requestor.has_perm(AccountPermissions.MANAGE_STAFF):
+            qs = auth_models.Group.objects.none()
+        else:
+            qs = resolve_permission_groups(info)
+
+        return resolve_federation_references(Group, roots, qs)
+
+
+class GroupCountableConnection(CountableConnection):
+    class Meta:
+        node = Group

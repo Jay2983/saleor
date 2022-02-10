@@ -6,8 +6,10 @@ from measurement.measures import Weight
 from prices import Money, fixed_discount
 
 from ...core.notify_events import NotifyEventType
+from ...core.prices import quantize_price
 from ...discount import DiscountValueType
 from ...order import notifications
+from ...order.fetch import fetch_order_info
 from ...plugins.manager import get_plugins_manager
 from ...product.models import DigitalContentUrl
 from ..notifications import (
@@ -120,6 +122,7 @@ def test_get_order_line_payload(order_line):
     total_gross = order_line.unit_price_gross * order_line.quantity
     total_net = order_line.unit_price_net * order_line.quantity
     total_tax = total_gross - total_net
+    currency = order_line.currency
     assert payload == {
         "variant": {
             "id": order_line.variant_id,
@@ -150,12 +153,16 @@ def test_get_order_line_payload(order_line):
         "quantity": order_line.quantity,
         "quantity_fulfilled": order_line.quantity_fulfilled,
         "currency": order_line.currency,
-        "unit_price_net_amount": order_line.unit_price_net_amount,
-        "unit_price_gross_amount": order_line.unit_price_gross_amount,
-        "unit_tax_amount": unit_tax_amount,
-        "total_gross_amount": total_gross.amount,
-        "total_net_amount": total_net.amount,
-        "total_tax_amount": total_tax.amount,
+        "unit_price_net_amount": quantize_price(
+            order_line.unit_price_net_amount, currency
+        ),
+        "unit_price_gross_amount": quantize_price(
+            order_line.unit_price_gross_amount, currency
+        ),
+        "unit_tax_amount": quantize_price(unit_tax_amount, currency),
+        "total_gross_amount": quantize_price(total_gross.amount, currency),
+        "total_net_amount": quantize_price(total_net.amount, currency),
+        "total_tax_amount": quantize_price(total_tax.amount, currency),
         "tax_rate": order_line.tax_rate,
         "is_digital": order_line.is_digital,
         "digital_url": "",
@@ -299,6 +306,7 @@ def test_get_default_fulfillment_payload(
 def test_send_email_payment_confirmation(mocked_notify, site_settings, payment_dummy):
     manager = get_plugins_manager()
     order = payment_dummy.order
+    order_info = fetch_order_info(order)
     expected_payload = {
         "order": get_default_order_payload(order),
         "recipient_email": order.get_customer_email(),
@@ -313,7 +321,7 @@ def test_send_email_payment_confirmation(mocked_notify, site_settings, payment_d
         "site_name": "mirumee.com",
         "domain": "mirumee.com",
     }
-    notifications.send_payment_confirmation(order, manager)
+    notifications.send_payment_confirmation(order_info, manager)
     mocked_notify.assert_called_once_with(
         NotifyEventType.ORDER_PAYMENT_CONFIRMATION,
         expected_payload,
@@ -325,8 +333,9 @@ def test_send_email_payment_confirmation(mocked_notify, site_settings, payment_d
 def test_send_email_order_confirmation(mocked_notify, order, site_settings):
     manager = get_plugins_manager()
     redirect_url = "https://www.example.com"
+    order_info = fetch_order_info(order)
 
-    notifications.send_order_confirmation(order, redirect_url, manager)
+    notifications.send_order_confirmation(order_info, redirect_url, manager)
 
     expected_payload = {
         "order": get_default_order_payload(order, redirect_url),
@@ -347,10 +356,9 @@ def test_send_email_order_confirmation_for_cc(
 ):
     manager = get_plugins_manager()
     redirect_url = "https://www.example.com"
+    order_info = fetch_order_info(order_with_lines_for_cc)
 
-    notifications.send_order_confirmation(
-        order_with_lines_for_cc, redirect_url, manager
-    )
+    notifications.send_order_confirmation(order_info, redirect_url, manager)
 
     expected_payload = {
         "order": get_default_order_payload(order_with_lines_for_cc, redirect_url),
@@ -383,6 +391,7 @@ def test_send_confirmation_emails_without_addresses_for_payment(
         user=info.context.user,
         app=info.context.app,
         manager=info.context.plugins,
+        site_settings=site_settings,
     )
     DigitalContentUrl.objects.create(content=digital_content, line=line)
 
@@ -390,8 +399,9 @@ def test_send_confirmation_emails_without_addresses_for_payment(
     order.shipping_method = None
     order.billing_address = None
     order.save(update_fields=["shipping_address", "shipping_method", "billing_address"])
+    order_info = fetch_order_info(order)
 
-    notifications.send_payment_confirmation(order, info.context.plugins)
+    notifications.send_payment_confirmation(order_info, info.context.plugins)
 
     expected_payload = {
         "order": get_default_order_payload(order),
@@ -428,6 +438,7 @@ def test_send_confirmation_emails_without_addresses_for_order(
         user=info.context.user,
         app=info.context.app,
         manager=info.context.plugins,
+        site_settings=site_settings,
     )
     DigitalContentUrl.objects.create(content=digital_content, line=line)
 
@@ -435,10 +446,13 @@ def test_send_confirmation_emails_without_addresses_for_order(
     order.shipping_method = None
     order.billing_address = None
     order.save(update_fields=["shipping_address", "shipping_method", "billing_address"])
+    order_info = fetch_order_info(order)
 
     redirect_url = "https://www.example.com"
 
-    notifications.send_order_confirmation(order, redirect_url, info.context.plugins)
+    notifications.send_order_confirmation(
+        order_info, redirect_url, info.context.plugins
+    )
 
     expected_payload = {
         "order": get_default_order_payload(order, redirect_url),

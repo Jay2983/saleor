@@ -1,7 +1,7 @@
 import json
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, cast
 
 import graphene
 from babel.numbers import get_currency_precision
@@ -19,6 +19,7 @@ from . import (
     PaymentError,
     StorePaymentMethod,
     TransactionKind,
+    gateway,
 )
 from .error_codes import PaymentErrorCode
 from .interface import (
@@ -52,19 +53,27 @@ def create_payment_information(
     Returns information required to process payment and additional
     billing/shipping addresses for optional fraud-prevention mechanisms.
     """
-    checkout = payment.checkout
-    if checkout:
+    if checkout := payment.checkout:
         billing = checkout.billing_address
         shipping = checkout.shipping_address
-        email = checkout.get_customer_email()
+        email = cast(str, checkout.get_customer_email())
         user_id = checkout.user_id
-    elif payment.order:
-        billing = payment.order.billing_address
-        shipping = payment.order.shipping_address
-        email = payment.order.user_email
-        user_id = payment.order.user_id
+        checkout_token = str(checkout.token)
+        checkout_metadata = checkout.metadata
+    elif order := payment.order:
+        billing = order.billing_address
+        shipping = order.shipping_address
+        email = order.user_email
+        user_id = order.user_id
+        checkout_token = order.checkout_token
+        checkout_metadata = None
     else:
-        billing, shipping, email, user_id = None, None, payment.billing_email, None
+        billing = None
+        shipping = None
+        email = payment.billing_email
+        user_id = None
+        checkout_token = ""
+        checkout_metadata = None
 
     billing_address = AddressData(**billing.as_data()) if billing else None
     shipping_address = AddressData(**shipping.as_data()) if shipping else None
@@ -95,7 +104,10 @@ def create_payment_information(
         store_payment_method=StorePaymentMethodEnum[
             payment.store_payment_method.upper()
         ],
+        checkout_token=checkout_token,
+        checkout_metadata=checkout_metadata,
         payment_metadata=payment.metadata,
+        psp_reference=payment.psp_reference,
     )
 
 
@@ -160,6 +172,7 @@ def create_payment(
         "gateway": gateway,
         "total": total,
         "return_url": return_url,
+        "partial": False,
         "psp_reference": external_reference or "",
         "store_payment_method": store_payment_method,
         "metadata": {} if metadata is None else metadata,
@@ -299,6 +312,12 @@ def gateway_postprocess(transaction, payment):
     if payment.to_confirm:
         payment.to_confirm = False
         changed_fields.append("to_confirm")
+
+    update_payment_charge_status(payment, transaction, changed_fields)
+
+
+def update_payment_charge_status(payment, transaction, changed_fields=None):
+    changed_fields = changed_fields or []
 
     transaction_kind = transaction.kind
 
@@ -448,6 +467,39 @@ def price_to_minor_unit(value: Decimal, currency: str):
     number_places = Decimal("10.0") ** precision
     value_without_comma = value * number_places
     return str(value_without_comma.quantize(Decimal("1")))
+
+
+def get_channel_slug_from_payment(payment: Payment) -> Optional[str]:
+    channel_slug = None
+
+    if payment.checkout:
+        channel_slug = payment.checkout.channel.slug
+    elif payment.order:
+        channel_slug = payment.order.channel.slug
+
+    return channel_slug
+
+
+def try_void_or_refund_inactive_payment(
+    payment: Payment, transaction: Transaction, manager: "PluginsManager"
+):
+    """Handle refund or void inactive payments.
+
+    In case when we have open multiple payments for single checkout but only one is
+    active. Some payment methods don't required confirmation so we can receive delayed
+    webhook when we have order already paid.
+    """
+    if transaction.is_success:
+        update_payment_charge_status(payment, transaction)
+        channel_slug = get_channel_slug_from_payment(payment)
+        try:
+            gateway.payment_refund_or_void(payment, manager, channel_slug=channel_slug)
+        except PaymentError:
+            logger.exception(
+                "Unable to void/refund an inactive payment %s, %s.",
+                payment.id,
+                payment.psp_reference,
+            )
 
 
 def payment_owned_by_user(payment_pk: int, user) -> bool:

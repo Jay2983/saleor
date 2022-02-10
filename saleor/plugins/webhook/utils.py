@@ -1,15 +1,30 @@
+import base64
 import decimal
+import json
+from contextlib import contextmanager
 from dataclasses import dataclass
+from time import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from django.db.models import QuerySet
+from prices import Money
+
+from ...core.models import (
+    EventDelivery,
+    EventDeliveryAttempt,
+    EventDeliveryStatus,
+    EventPayload,
+)
 from ...payment.interface import GatewayResponse, PaymentGateway, PaymentMethodInfo
+from ...shipping.interface import ShippingMethodData
 
 if TYPE_CHECKING:
     from ...app.models import App
     from ...payment.interface import PaymentData
+    from .tasks import WebhookResponse
 
 
-APP_GATEWAY_ID_PREFIX = "app"
+APP_ID_PREFIX = "app"
 
 
 @dataclass
@@ -18,17 +33,25 @@ class PaymentAppData:
     name: str
 
 
+@dataclass
+class ShippingAppData:
+    app_pk: int
+    shipping_method_id: str
+
+
 def to_payment_app_id(app: "App", gateway_id: str) -> "str":
-    return f"{APP_GATEWAY_ID_PREFIX}:{app.pk}:{gateway_id}"
+    return f"{APP_ID_PREFIX}:{app.pk}:{gateway_id}"
+
+
+def to_shipping_app_id(app: "App", shipping_method_id: str) -> "str":
+    return base64.b64encode(
+        str.encode(f"{APP_ID_PREFIX}:{app.pk}:{shipping_method_id}")
+    ).decode("utf-8")
 
 
 def from_payment_app_id(app_gateway_id: str) -> Optional["PaymentAppData"]:
     splitted_id = app_gateway_id.split(":")
-    if (
-        len(splitted_id) == 3
-        and splitted_id[0] == APP_GATEWAY_ID_PREFIX
-        and all(splitted_id)
-    ):
+    if len(splitted_id) == 3 and splitted_id[0] == APP_ID_PREFIX and all(splitted_id):
         try:
             app_pk = int(splitted_id[1])
         except (TypeError, ValueError):
@@ -104,3 +127,98 @@ def parse_payment_action_response(
             "transaction_already_processed", False
         ),
     )
+
+
+def parse_list_shipping_methods_response(
+    response_data: Any, app: "App"
+) -> List["ShippingMethodData"]:
+    shipping_methods = []
+    for shipping_method_data in response_data:
+        method_id = shipping_method_data.get("id")
+        method_name = shipping_method_data.get("name")
+        method_amount = shipping_method_data.get("amount")
+        method_currency = shipping_method_data.get("currency")
+        method_maximum_delivery_days = shipping_method_data.get("maximum_delivery_days")
+
+        shipping_methods.append(
+            ShippingMethodData(
+                id=to_shipping_app_id(app, method_id),
+                name=method_name,
+                price=Money(method_amount, method_currency),
+                maximum_delivery_days=method_maximum_delivery_days,
+            )
+        )
+    return shipping_methods
+
+
+@contextmanager
+def catch_duration_time():
+    start = time()
+    yield lambda: time() - start
+
+
+def create_event_delivery_list_for_webhooks(
+    webhooks: QuerySet,
+    event_payload: "EventPayload",
+    event_type: str,
+) -> List[EventDelivery]:
+
+    event_deliveries = EventDelivery.objects.bulk_create(
+        [
+            EventDelivery(
+                status=EventDeliveryStatus.PENDING,
+                event_type=event_type,
+                payload=event_payload,
+                webhook=webhook,
+            )
+            for webhook in webhooks
+        ]
+    )
+    return event_deliveries
+
+
+def create_attempt(
+    delivery: "EventDelivery",
+    task_id: str = None,
+):
+    attempt = EventDeliveryAttempt.objects.create(
+        delivery=delivery,
+        task_id=task_id,
+        duration=None,
+        response=None,
+        request_headers=None,
+        response_headers=None,
+        status=EventDeliveryStatus.PENDING,
+    )
+    return attempt
+
+
+def attempt_update(
+    attempt: "EventDeliveryAttempt",
+    webhook_response: "WebhookResponse",
+):
+
+    attempt.duration = webhook_response.duration
+    attempt.response = webhook_response.content
+    attempt.response_headers = json.dumps(webhook_response.response_headers)
+    attempt.request_headers = json.dumps(webhook_response.request_headers)
+    attempt.status = webhook_response.status
+    attempt.save(
+        update_fields=[
+            "duration",
+            "response",
+            "response_headers",
+            "request_headers",
+            "status",
+        ]
+    )
+
+
+def delivery_update(delivery: "EventDelivery", status: str):
+    delivery.status = status
+    delivery.save(update_fields=["status"])
+
+
+def clear_successful_delivery(delivery: "EventDelivery"):
+    if delivery.status == EventDeliveryStatus.SUCCESS:
+        delivery.delete()

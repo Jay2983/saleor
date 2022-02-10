@@ -9,6 +9,7 @@ from .....checkout.fetch import (
     get_delivery_method_info,
 )
 from .....plugins.manager import get_plugins_manager
+from .....shipping.utils import convert_to_shipping_method_data
 from ....tests.utils import get_graphql_content
 
 MUTATION_UPDATE_SHIPPING_METHOD = """
@@ -38,9 +39,9 @@ def test_checkout_shipping_method_update_by_id(
     mock_clean_shipping,
     staff_api_client,
     shipping_method,
-    checkout_with_item,
+    checkout_with_item_and_shipping_method,
 ):
-    checkout = checkout_with_item
+    checkout = checkout_with_item_and_shipping_method
     old_shipping_method = checkout.shipping_method
     query = MUTATION_UPDATE_SHIPPING_METHOD
     mock_clean_shipping.return_value = True
@@ -56,14 +57,21 @@ def test_checkout_shipping_method_update_by_id(
     checkout.refresh_from_db()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     checkout_info.delivery_method_info = get_delivery_method_info(
-        old_shipping_method, None
+        convert_to_shipping_method_data(
+            old_shipping_method, old_shipping_method.channel_listings.first()
+        ),
+        None,
     )
-    checkout_info.shipping_method_channel_listings = None
+
     mock_clean_shipping.assert_called_once_with(
-        checkout_info=checkout_info, lines=lines, method=shipping_method
+        checkout_info=checkout_info,
+        lines=lines,
+        method=convert_to_shipping_method_data(
+            shipping_method, shipping_method.channel_listings.first()
+        ),
     )
     errors = data["errors"]
     assert not errors
@@ -76,9 +84,9 @@ def test_checkout_shipping_method_update_by_token(
     mock_clean_shipping,
     staff_api_client,
     shipping_method,
-    checkout_with_item,
+    checkout_with_item_and_shipping_method,
 ):
-    checkout = checkout_with_item
+    checkout = checkout_with_item_and_shipping_method
     old_shipping_method = checkout.shipping_method
     query = MUTATION_UPDATE_SHIPPING_METHOD
     mock_clean_shipping.return_value = True
@@ -94,14 +102,20 @@ def test_checkout_shipping_method_update_by_token(
     checkout.refresh_from_db()
 
     manager = get_plugins_manager()
-    lines = fetch_checkout_lines(checkout)
+    lines, _ = fetch_checkout_lines(checkout)
     checkout_info = fetch_checkout_info(checkout, lines, [], manager)
     checkout_info.delivery_method_info = get_delivery_method_info(
-        old_shipping_method, None
+        convert_to_shipping_method_data(
+            old_shipping_method, old_shipping_method.channel_listings.first()
+        ),
+        None,
     )
-    checkout_info.shipping_method_channel_listings = None
     mock_clean_shipping.assert_called_once_with(
-        checkout_info=checkout_info, lines=lines, method=shipping_method
+        checkout_info=checkout_info,
+        lines=lines,
+        method=convert_to_shipping_method_data(
+            shipping_method, shipping_method.channel_listings.first()
+        ),
     )
     errors = data["errors"]
     assert not errors

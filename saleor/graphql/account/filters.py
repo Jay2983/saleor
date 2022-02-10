@@ -1,10 +1,13 @@
 import django_filters
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count
+from graphene_django.filter import GlobalIDMultipleChoiceFilter
 
-from ...account.models import Address, User
+from ...account.models import User
+from ...account.search import search_users
 from ..core.filters import EnumFilter, MetadataFilterBase, ObjectTypeFilter
 from ..core.types.common import DateRangeInput, IntRangeInput
-from ..utils.filters import filter_range_field
+from ..utils.filters import filter_by_id, filter_range_field
+from . import types as account_types
 from .enums import StaffMemberStatus
 
 
@@ -30,25 +33,7 @@ def filter_staff_status(qs, _, value):
 
 
 def filter_user_search(qs, _, value):
-    if value:
-        UserAddress = User.addresses.through
-        addresses = Address.objects.filter(
-            Q(first_name__ilike=value)
-            | Q(last_name__ilike=value)
-            | Q(city__ilike=value)
-            | Q(country__ilike=value)
-            | Q(phone=value)
-        ).values("id")
-        user_addresses = UserAddress.objects.filter(
-            Exists(addresses.filter(pk=OuterRef("address_id")))
-        ).values("user_id")
-        qs = qs.filter(
-            Q(email__ilike=value)
-            | Q(first_name__ilike=value)
-            | Q(last_name__ilike=value)
-            | Q(Exists(user_addresses.filter(user_id=OuterRef("pk"))))
-        )
-    return qs
+    return search_users(qs, value)
 
 
 def filter_search(qs, _, value):
@@ -81,12 +66,17 @@ class CustomerFilter(MetadataFilterBase):
 
 class PermissionGroupFilter(django_filters.FilterSet):
     search = django_filters.CharFilter(method=filter_search)
+    ids = GlobalIDMultipleChoiceFilter(method=filter_by_id(account_types.Group))
 
 
 class StaffUserFilter(django_filters.FilterSet):
     status = EnumFilter(input_class=StaffMemberStatus, method=filter_staff_status)
     search = django_filters.CharFilter(method=filter_user_search)
-
+    ids = GlobalIDMultipleChoiceFilter(
+        method=filter_by_id(
+            account_types.User,
+        )
+    )
     # TODO - Figure out after permission types
     # department = ObjectTypeFilter
 

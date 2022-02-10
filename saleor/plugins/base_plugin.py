@@ -1,13 +1,17 @@
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional, Tuple, Union
 
 from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpResponse
+from django.utils.functional import SimpleLazyObject
 from django_countries.fields import Country
 from prices import Money, TaxedMoney
+from promise.promise import Promise
 
+from ..checkout.interface import CheckoutTaxedPricesData
+from ..core.models import EventDelivery
 from ..payment.interface import (
     CustomerSource,
     GatewayResponse,
@@ -23,6 +27,7 @@ if TYPE_CHECKING:
     from ..channel.models import Channel
     from ..checkout.fetch import CheckoutInfo, CheckoutLineInfo
     from ..checkout.models import Checkout
+    from ..core.middleware import Requestor
     from ..core.notify_events import NotifyEventType
     from ..core.taxes import TaxType
     from ..discount import DiscountInfo
@@ -31,10 +36,12 @@ if TYPE_CHECKING:
     from ..invoice.models import Invoice
     from ..order.models import Fulfillment, Order, OrderLine
     from ..page.models import Page
-    from ..product.models import Product, ProductType, ProductVariant
+    from ..product.models import Collection, Product, ProductType, ProductVariant
+    from ..shipping.interface import ShippingMethodData
 
 PluginConfigurationType = List[dict]
 NoneType = type(None)
+RequestorOrLazyObject = Union[SimpleLazyObject, "Requestor"]
 
 
 class ConfigurationTypeField:
@@ -90,11 +97,17 @@ class BasePlugin:
         *,
         configuration: PluginConfigurationType,
         active: bool,
-        channel: Optional["Channel"] = None
+        channel: Optional["Channel"] = None,
+        requestor_getter: Optional[Callable[[], "Requestor"]] = None,
+        db_config: Optional["PluginConfiguration"] = None
     ):
         self.configuration = self.get_plugin_configuration(configuration)
         self.active = active
         self.channel = channel
+        self.requestor: Optional[RequestorOrLazyObject] = (
+            SimpleLazyObject(requestor_getter) if requestor_getter else requestor_getter
+        )
+        self.db_config = db_config
 
     def __str__(self):
         return self.PLUGIN_NAME
@@ -105,12 +118,6 @@ class BasePlugin:
     apply_taxes_to_product: Callable[
         ["Product", Money, Country, TaxedMoney], TaxedMoney
     ]
-
-    #  Apply taxes to the shipping costs based on the shipping address.
-    #
-    #  Overwrite this method if you want to show available shipping methods with
-    #  taxes.
-    apply_taxes_to_shipping: Callable[[Money, "Address", TaxedMoney], TaxedMoney]
 
     #  Assign tax code dedicated to plugin.
     assign_tax_code_to_object_meta: Callable[
@@ -137,7 +144,7 @@ class BasePlugin:
             Iterable["DiscountInfo"],
             TaxedMoney,
         ],
-        TaxedMoney,
+        CheckoutTaxedPricesData,
     ]
 
     #  Calculate checkout line unit price.
@@ -150,7 +157,7 @@ class BasePlugin:
             Iterable["DiscountInfo"],
             Any,
         ],
-        Any,
+        CheckoutTaxedPricesData,
     ]
 
     #  Calculate the shipping costs for checkout.
@@ -213,6 +220,9 @@ class BasePlugin:
         ["Address", Union[str, NoneType], Union["User", NoneType], "Address"], "Address"
     ]
 
+    #  Retrieves the balance remaining on a shopper's gift card
+    check_payment_balance: Callable[[dict, str], dict]
+
     #  Trigger when checkout is created.
     #
     #  Overwrite this method if you need to trigger specific logic when a checkout is
@@ -224,6 +234,24 @@ class BasePlugin:
     #  Overwrite this method if you need to trigger specific logic when a checkout is
     #  updated.
     checkout_updated: Callable[["Checkout", Any], Any]
+
+    #  Trigger when collection is created.
+    #
+    #  Overwrite this method if you need to trigger specific logic after a collection is
+    #  created.
+    collection_created: Callable[["Collection", Any], Any]
+
+    #  Trigger when collection is deleted.
+    #
+    #  Overwrite this method if you need to trigger specific logic after a collection is
+    #  deleted.
+    collection_deleted: Callable[["Collection", Any], Any]
+
+    #  Trigger when collection is updated.
+    #
+    #  Overwrite this method if you need to trigger specific logic after a collection is
+    #  updated.
+    collection_updated: Callable[["Collection", Any], Any]
 
     confirm_payment: Callable[["PaymentData", Any], GatewayResponse]
 
@@ -312,6 +340,10 @@ class BasePlugin:
     get_order_shipping_tax_rate: Callable[["Order", Any], Any]
     get_payment_config: Callable[[Any], Any]
 
+    get_shipping_methods_for_checkout: Callable[
+        ["Checkout", Any], List["ShippingMethodData"]
+    ]
+
     get_supported_currencies: Callable[[Any], Any]
 
     #  Return tax code from object meta.
@@ -343,9 +375,11 @@ class BasePlugin:
     invoice_delete: Callable[["Invoice", Any], Any]
 
     #  Trigger when invoice creation starts.
-    #
+    #  May return Invoice object.
     #  Overwrite to create invoice with proper data, call invoice.update_invoice.
-    invoice_request: Callable[["Order", "Invoice", Union[str, NoneType], Any], Any]
+    invoice_request: Callable[
+        ["Order", "Invoice", Union[str, NoneType], Any], Optional["Invoice"]
+    ]
 
     #  Trigger after invoice is sent.
     invoice_sent: Callable[["Invoice", str, Any], Any]
@@ -493,16 +527,25 @@ class BasePlugin:
     #  Overwrite this method if the plugin expects the incoming requests.
     webhook: Callable[[WSGIRequest, str, Any], HttpResponse]
 
+    # Triggers retry mechanism for event delivery
+    event_delivery_retry: Callable[["EventDelivery", Any], EventDelivery]
+
     def token_is_required_as_payment_input(self, previous_value):
         return previous_value
 
     def get_payment_gateways(
         self, currency: Optional[str], checkout: Optional["Checkout"], previous_value
     ) -> List["PaymentGateway"]:
-        payment_config = self.get_payment_config(previous_value)  # type: ignore
-        payment_config = payment_config if payment_config != NotImplemented else []
-        currencies = self.get_supported_currencies(previous_value=[])  # type: ignore
-        currencies = currencies if currencies != NotImplemented else []
+        payment_config = (
+            self.get_payment_config(previous_value)  # type: ignore
+            if hasattr(self, "get_payment_config")
+            else []
+        )
+        currencies = (
+            self.get_supported_currencies(previous_value=[])  # type: ignore
+            if hasattr(self, "get_supported_currencies")
+            else []
+        )
         if currency and currency not in currencies:
             return []
         gateway = PaymentGateway(
@@ -554,7 +597,9 @@ class BasePlugin:
             )
 
     @classmethod
-    def validate_plugin_configuration(cls, plugin_configuration: "PluginConfiguration"):
+    def validate_plugin_configuration(
+        cls, plugin_configuration: "PluginConfiguration", **kwargs
+    ):
         """Validate if provided configuration is correct.
 
         Raise django.core.exceptions.ValidationError otherwise.
@@ -577,11 +622,14 @@ class BasePlugin:
         configuration_to_update = cleaned_data.get("configuration")
         if configuration_to_update:
             cls._update_config_items(configuration_to_update, current_config)
+
         if "active" in cleaned_data:
             plugin_configuration.active = cleaned_data["active"]
+
         cls.validate_plugin_configuration(plugin_configuration)
         cls.pre_save_plugin_configuration(plugin_configuration)
         plugin_configuration.save()
+
         if plugin_configuration.configuration:
             # Let's add a translated descriptions and labels
             cls._append_config_structure(plugin_configuration.configuration)
@@ -650,3 +698,12 @@ class BasePlugin:
             # Let's add a translated descriptions and labels
             self._append_config_structure(configuration)
         return configuration
+
+    def resolve_plugin_configuration(
+        self, request
+    ) -> Union[PluginConfigurationType, Promise[PluginConfigurationType]]:
+        # Override this function to customize resolving plugin configuration in API.
+        return self.configuration
+
+    def is_event_active(self, event: str, channel=Optional[str]):
+        return hasattr(self, event)
